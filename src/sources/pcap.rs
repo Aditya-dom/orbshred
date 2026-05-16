@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 
-use crate::registry::{ShredEvent, SourceId};
+use crate::registry::{DropCounters, ShredEvent, SourceId};
 
 /// One routing entry per pcap source sharing a socket.
 /// The capture loop checks each packet against all routes and sends a ShredEvent
@@ -23,13 +23,22 @@ pub async fn run(
     interface: String,
     recv_buf_size: usize,
     routes: Vec<PcapRoute>,
-    tx: mpsc::UnboundedSender<ShredEvent>,
+    anchor: crate::sources::kernel_ts::ClockAnchor,
+    pin_cpu: Option<usize>,
+    tx: mpsc::Sender<ShredEvent>,
+    drops: DropCounters,
     cancel: CancellationToken,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = linux::capture_loop(port, &interface, recv_buf_size, &routes, &tx, &cancel) {
+            if let Some(cpu) = pin_cpu {
+                match crate::sources::affinity::pin_current_thread(cpu) {
+                    Ok(()) => tracing::info!("pcap: pinned capture thread to CPU {}", cpu),
+                    Err(e) => tracing::warn!("pcap: failed to pin to CPU {}: {}", cpu, e),
+                }
+            }
+            if let Err(e) = linux::capture_loop(port, &interface, recv_buf_size, &routes, anchor, &tx, &drops, &cancel) {
                 tracing::error!("Raw packet capture error: {:#}", e);
             }
         });
@@ -37,7 +46,7 @@ pub async fn run(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (port, interface, recv_buf_size, routes, tx, cancel);
+        let _ = (port, interface, recv_buf_size, routes, anchor, pin_cpu, tx, drops, cancel);
         anyhow::bail!("Raw packet capture (AF_PACKET) is only supported on Linux")
     }
 }
@@ -51,23 +60,40 @@ mod linux {
     use tokio_util::sync::CancellationToken;
     use tracing::{info, warn};
 
-    use crate::registry::ShredEvent;
+    use crate::registry::{DropCounters, ShredEvent};
     use crate::shred::parse_shred_key;
     use super::PcapRoute;
 
-    /// Extract the source IPv4 address from a raw Ethernet frame.
-    /// Source IP is at byte offset 26 (14-byte Ethernet header + 12 bytes into IP header).
+    /// Return the offset of the IP header within an Ethernet frame, handling a
+    /// single 802.1Q VLAN tag if present. Returns None if the frame is too short
+    /// or the ethertype is not IPv4 (after unwrapping VLAN).
+    fn ip_header_offset(buf: &[u8]) -> Option<usize> {
+        if buf.len() < 14 { return None; }
+        let ethertype = u16::from_be_bytes([buf[12], buf[13]]);
+        if ethertype == 0x0800 {
+            Some(14)
+        } else if ethertype == 0x8100 {
+            if buf.len() < 18 { return None; }
+            let inner = u16::from_be_bytes([buf[16], buf[17]]);
+            if inner == 0x0800 { Some(18) } else { None }
+        } else {
+            None
+        }
+    }
+
+    /// Extract the source IPv4 address from a raw Ethernet frame (IPv4 or VLAN+IPv4).
     fn extract_src_ip(buf: &[u8]) -> Option<Ipv4Addr> {
-        if buf.len() < 30 { return None; }
-        Some(Ipv4Addr::new(buf[26], buf[27], buf[28], buf[29]))
+        let ip_start = ip_header_offset(buf)?;
+        let src_off = ip_start + 12;
+        if buf.len() < src_off + 4 { return None; }
+        Some(Ipv4Addr::new(buf[src_off], buf[src_off + 1], buf[src_off + 2], buf[src_off + 3]))
     }
 
     /// Extract the UDP payload from a raw Ethernet frame.
-    /// Returns None if not IPv4/UDP or fragmented.
+    /// Returns None if not IPv4/UDP or fragmented. Handles a single 802.1Q VLAN tag.
     fn extract_udp_payload(buf: &[u8]) -> Option<&[u8]> {
-        if buf.len() < 42 { return None; }
-        if u16::from_be_bytes([buf[12], buf[13]]) != 0x0800 { return None; }
-        let ip_start = 14;
+        let ip_start = ip_header_offset(buf)?;
+        if buf.len() < ip_start + 20 { return None; }
         let ihl = ((buf[ip_start] & 0x0f) * 4) as usize;
         if ihl < 20 || buf.len() < ip_start + ihl + 8 { return None; }
         if buf[ip_start + 9] != 17 { return None; }
@@ -103,7 +129,9 @@ mod linux {
         interface: &str,
         recv_buf_size: usize,
         routes: &[PcapRoute],
-        tx: &mpsc::UnboundedSender<ShredEvent>,
+        anchor: crate::sources::kernel_ts::ClockAnchor,
+        tx: &mpsc::Sender<ShredEvent>,
+        drops: &DropCounters,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
         let fd = unsafe {
@@ -124,21 +152,15 @@ mod linux {
             return Err(err.into());
         }
 
-        // Classic BPF filter: udp dst port <port>
-        let port_u32 = port as u32;
-        let filter: [libc::sock_filter; 11] = [
-            libc::sock_filter { code: 0x28, jt: 0, jf: 0,  k: 12       },
-            libc::sock_filter { code: 0x15, jt: 0, jf: 8,  k: 0x0800   },
-            libc::sock_filter { code: 0x30, jt: 0, jf: 0,  k: 23       },
-            libc::sock_filter { code: 0x15, jt: 0, jf: 6,  k: 0x11     },
-            libc::sock_filter { code: 0x28, jt: 0, jf: 0,  k: 20       },
-            libc::sock_filter { code: 0x45, jt: 4, jf: 0,  k: 0x1fff   },
-            libc::sock_filter { code: 0xb1, jt: 0, jf: 0,  k: 14       },
-            libc::sock_filter { code: 0x48, jt: 0, jf: 0,  k: 16       },
-            libc::sock_filter { code: 0x15, jt: 0, jf: 1,  k: port_u32 },
-            libc::sock_filter { code: 0x06, jt: 0, jf: 0,  k: 0xffff   },
-            libc::sock_filter { code: 0x06, jt: 0, jf: 0,  k: 0        },
-        ];
+        // Build the filter as the platform-independent `SockFilter` mirror,
+        // then reinterpret-cast at the syscall boundary. Layout compatibility
+        // with `libc::sock_filter` is verified at compile time.
+        const _: () = assert!(
+            std::mem::size_of::<crate::sources::bpf_filter::SockFilter>()
+                == std::mem::size_of::<libc::sock_filter>(),
+            "SockFilter layout must match libc::sock_filter",
+        );
+        let filter = crate::sources::bpf_filter::build_bpf_filter(port);
         let prog = libc::sock_fprog {
             len: filter.len() as u16,
             filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -207,11 +229,23 @@ mod linux {
             );
         }
 
+        // Try to enable kernel-side timestamps. AF_PACKET fully supports
+        // SO_TIMESTAMPNS — failure here is unusual but recoverable.
+        let kernel_ts_enabled =
+            match crate::sources::kernel_ts::enable_kernel_timestamps(fd) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("AF_PACKET: SO_TIMESTAMPNS unavailable, using userland timestamps: {}", e);
+                    false
+                }
+            };
+
         let iface_display = if interface.is_empty() { "all" } else { interface };
         info!(
-            "Raw packet capture started (port={}, iface={}, {} route{})",
+            "Raw packet capture started (port={}, iface={}, {} route{}, {})",
             port, iface_display, routes.len(),
-            if routes.len() == 1 { "" } else { "s" }
+            if routes.len() == 1 { "" } else { "s" },
+            if kernel_ts_enabled { "kernel timestamps" } else { "userland timestamps" }
         );
 
         let mut buf = vec![0u8; 2048];
@@ -225,21 +259,36 @@ mod linux {
         loop {
             if cancel.is_cancelled() { break; }
 
-            let n = unsafe {
-                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-            };
-            let received_at = Instant::now();
-
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut
-                {
+            let (n, received_at) = if kernel_ts_enabled {
+                match crate::sources::kernel_ts::recv_with_timestamp(fd, &mut buf, &anchor) {
+                    Ok((n, ts)) => (n as isize, ts),
+                    Err(err) => {
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut
+                        {
+                            continue;
+                        }
+                        warn!("Raw packet capture recv error: {}", err);
+                        continue;
+                    }
+                }
+            } else {
+                let n = unsafe {
+                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+                };
+                let ts = Instant::now();
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut
+                    {
+                        continue;
+                    }
+                    warn!("Raw packet capture recv error: {}", err);
                     continue;
                 }
-                warn!("Raw packet capture recv error: {}", err);
-                continue;
-            }
+                (n, ts)
+            };
 
             raw_count += 1;
             let frame = &buf[..n as usize];
@@ -252,11 +301,14 @@ mod linux {
                     for (i, route) in routes.iter().enumerate() {
                         if route_matches(route, src_ip) {
                             route_counts[i] += 1;
-                            let _ = tx.send(ShredEvent {
+                            let event = ShredEvent {
                                 source: route.source_id,
-                                key: key.clone(),
+                                key,
                                 received_at,
-                            });
+                            };
+                            if tx.try_send(event).is_err() {
+                                drops.inc(route.source_id);
+                            }
                         }
                     }
                 }
@@ -272,5 +324,135 @@ mod linux {
             info!("  route {:?}: {} shreds matched", route.source_id, route_counts[i]);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Build an Ethernet+IPv4+UDP frame with optional 802.1Q VLAN tag.
+        fn build_frame(vlan_tag: Option<u16>, src_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            // dst MAC (6) + src MAC (6)
+            buf.extend_from_slice(&[0u8; 12]);
+            // VLAN tag if requested
+            if let Some(vid) = vlan_tag {
+                buf.extend_from_slice(&[0x81, 0x00]);                  // 802.1Q TPID
+                buf.extend_from_slice(&(vid & 0x0fff).to_be_bytes());  // PCP/DEI/VID
+            }
+            // Inner ethertype: IPv4
+            buf.extend_from_slice(&[0x08, 0x00]);
+            // IPv4 header (20 bytes, no options)
+            let total_len = (20 + 8 + payload.len()) as u16;
+            buf.push(0x45);                              // version 4, IHL 5
+            buf.push(0x00);                              // TOS
+            buf.extend_from_slice(&total_len.to_be_bytes());
+            buf.extend_from_slice(&[0x00, 0x00]);        // identification
+            buf.extend_from_slice(&[0x00, 0x00]);        // flags+fragoff (none)
+            buf.push(64);                                // TTL
+            buf.push(17);                                // proto = UDP
+            buf.extend_from_slice(&[0x00, 0x00]);        // checksum (unused)
+            buf.extend_from_slice(&src_ip);              // src IP
+            buf.extend_from_slice(&[10, 0, 0, 1]);       // dst IP
+            // UDP header (8 bytes)
+            buf.extend_from_slice(&1234u16.to_be_bytes());  // src port
+            buf.extend_from_slice(&dst_port.to_be_bytes());
+            let udp_len = (8 + payload.len()) as u16;
+            buf.extend_from_slice(&udp_len.to_be_bytes());
+            buf.extend_from_slice(&[0x00, 0x00]);        // checksum (unused)
+            buf.extend_from_slice(payload);
+            buf
+        }
+
+        #[test]
+        fn ip_header_offset_plain_ipv4() {
+            let f = build_frame(None, [1, 2, 3, 4], 8001, &[]);
+            assert_eq!(ip_header_offset(&f), Some(14));
+        }
+
+        #[test]
+        fn ip_header_offset_vlan_tagged_ipv4() {
+            let f = build_frame(Some(10), [1, 2, 3, 4], 8001, &[]);
+            assert_eq!(ip_header_offset(&f), Some(18));
+        }
+
+        #[test]
+        fn ip_header_offset_rejects_non_ip_ethertype() {
+            let mut buf = vec![0u8; 12];
+            buf.extend_from_slice(&[0x08, 0x06]); // ARP
+            assert_eq!(ip_header_offset(&buf), None);
+        }
+
+        #[test]
+        fn ip_header_offset_rejects_vlan_carrying_non_ipv4() {
+            let mut buf = vec![0u8; 12];
+            buf.extend_from_slice(&[0x81, 0x00]); // VLAN TPID
+            buf.extend_from_slice(&[0x00, 0x0a]); // VID 10
+            buf.extend_from_slice(&[0x86, 0xdd]); // IPv6 ethertype
+            assert_eq!(ip_header_offset(&buf), None);
+        }
+
+        #[test]
+        fn ip_header_offset_truncated_frame() {
+            assert_eq!(ip_header_offset(&[0u8; 13]), None);
+            // VLAN header present but inner ethertype truncated
+            let mut buf = vec![0u8; 12];
+            buf.extend_from_slice(&[0x81, 0x00]);
+            buf.extend_from_slice(&[0x00, 0x0a]);
+            assert_eq!(ip_header_offset(&buf), None);
+        }
+
+        #[test]
+        fn extract_src_ip_plain_and_vlan() {
+            let plain = build_frame(None, [7, 8, 9, 10], 8001, &[]);
+            assert_eq!(extract_src_ip(&plain), Some(Ipv4Addr::new(7, 8, 9, 10)));
+            let vlan = build_frame(Some(42), [11, 12, 13, 14], 8001, &[]);
+            assert_eq!(extract_src_ip(&vlan), Some(Ipv4Addr::new(11, 12, 13, 14)));
+        }
+
+        #[test]
+        fn extract_udp_payload_plain_and_vlan() {
+            let payload = b"hello-shred";
+            let plain = build_frame(None, [1, 2, 3, 4], 8001, payload);
+            assert_eq!(extract_udp_payload(&plain), Some(&payload[..]));
+            let vlan = build_frame(Some(7), [1, 2, 3, 4], 8001, payload);
+            assert_eq!(extract_udp_payload(&vlan), Some(&payload[..]));
+        }
+
+        #[test]
+        fn extract_udp_payload_rejects_non_udp() {
+            let mut f = build_frame(None, [1, 2, 3, 4], 8001, b"x");
+            f[14 + 9] = 6; // change proto to TCP
+            assert_eq!(extract_udp_payload(&f), None);
+        }
+
+        #[test]
+        fn extract_udp_payload_rejects_fragmented() {
+            let mut f = build_frame(None, [1, 2, 3, 4], 8001, b"x");
+            // Set non-zero fragment offset (low 13 bits of flags+fragoff at IP+6).
+            f[14 + 6] = 0x00;
+            f[14 + 7] = 0x01;
+            assert_eq!(extract_udp_payload(&f), None);
+        }
+
+        #[test]
+        fn route_matches_include_and_exclude() {
+            let route = PcapRoute {
+                source_id: SourceId(1),
+                include_ips: [Ipv4Addr::new(1, 1, 1, 1)].into_iter().collect(),
+                exclude_ips: HashSet::new(),
+            };
+            assert!(route_matches(&route, Some(Ipv4Addr::new(1, 1, 1, 1))));
+            assert!(!route_matches(&route, Some(Ipv4Addr::new(2, 2, 2, 2))));
+            assert!(!route_matches(&route, None));
+
+            let route = PcapRoute {
+                source_id: SourceId(1),
+                include_ips: HashSet::new(),
+                exclude_ips: [Ipv4Addr::new(9, 9, 9, 9)].into_iter().collect(),
+            };
+            assert!(route_matches(&route, Some(Ipv4Addr::new(1, 1, 1, 1))));
+            assert!(!route_matches(&route, Some(Ipv4Addr::new(9, 9, 9, 9))));
+        }
     }
 }

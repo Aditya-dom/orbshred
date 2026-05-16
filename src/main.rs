@@ -18,13 +18,13 @@ mod sources;
 mod output;
 
 use config::Config;
-use registry::{GrpcLatencyEvent, Registry, ShredEvent, SlotEvent, SourceId};
+use registry::{DropCounters, GrpcLatencyEvent, Registry, ShredEvent, SlotEvent, SourceId};
 use stats::compute_stats;
 use output::table::print_results;
 use output::logfile::write_log;
 
 #[derive(Parser, Debug)]
-#[command(name = "orbshred", about = "Solana shred source latency benchmark")]
+#[command(name = "orbshred", version, about = "Solana shred source latency benchmark")]
 struct Args {
     /// Path to TOML config file
     #[arg(short, long, default_value = "config.toml")]
@@ -133,11 +133,19 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     let start_wall = Utc::now();
     let start_instant = registry.start_time;
+    let clock_anchor = registry.clock_anchor;
 
-    // Shared event channels
-    let (shred_tx, mut shred_rx) = mpsc::unbounded_channel::<ShredEvent>();
-    let (slot_tx, mut slot_rx) = mpsc::unbounded_channel::<SlotEvent>();
-    let (grpc_tx, mut grpc_rx) = mpsc::unbounded_channel::<GrpcLatencyEvent>();
+    // Shared event channels. Bounded so that backpressure is visible:
+    // when the aggregator can't keep up, sources increment their per-source
+    // drop counter (reported in the final output) instead of silently
+    // accumulating in RAM.
+    const SHRED_CHAN_CAP: usize = 65_536; // ~10ms of headroom at 6.5M shreds/s
+    const SLOT_CHAN_CAP: usize = 4_096;
+    const GRPC_CHAN_CAP: usize = 4_096;
+    let (shred_tx, mut shred_rx) = mpsc::channel::<ShredEvent>(SHRED_CHAN_CAP);
+    let (slot_tx, mut slot_rx) = mpsc::channel::<SlotEvent>(SLOT_CHAN_CAP);
+    let (grpc_tx, mut grpc_rx) = mpsc::channel::<GrpcLatencyEvent>(GRPC_CHAN_CAP);
+    let drops = DropCounters::new();
 
     // Sequential source ID assignment
     let mut next_id: u32 = 0;
@@ -157,7 +165,7 @@ async fn main() -> Result<()> {
         let name = source_name(&cfg.name, "Raw UDP", raw_udp_idx, total_raw_udp);
         let id = alloc_id();
         info!("Starting {} on {}", name, cfg.bind_addr);
-        sources::raw_udp::run(cfg.clone(), id, shred_tx.clone(), cancel.clone()).await?;
+        sources::raw_udp::run(cfg.clone(), id, clock_anchor, shred_tx.clone(), drops.clone(), cancel.clone()).await?;
         source_names.insert(id, name.clone());
         active_shred_sources.push((id, name));
         raw_udp_idx += 1;
@@ -195,8 +203,10 @@ async fn main() -> Result<()> {
             cfg.clone(),
             shred_id,
             entry_id,
+            clock_anchor,
             shred_tx.clone(),
             slot_tx.clone(),
+            drops.clone(),
             cancel.clone(),
         ).await?;
 
@@ -210,7 +220,7 @@ async fn main() -> Result<()> {
         let name = source_name(&cfg.name, "DoubleZero", dz_idx, total_dz);
         let id = alloc_id();
         info!("Starting {} ({}:{})", name, cfg.multicast_group, cfg.port);
-        sources::doublezero::run(cfg.clone(), id, shred_tx.clone(), cancel.clone()).await?;
+        sources::doublezero::run(cfg.clone(), id, clock_anchor, shred_tx.clone(), drops.clone(), cancel.clone()).await?;
         source_names.insert(id, name.clone());
         active_shred_sources.push((id, name));
         dz_idx += 1;
@@ -240,7 +250,7 @@ async fn main() -> Result<()> {
             None
         };
 
-        sources::yellowstone::run(cfg.clone(), id, account_source_id, slot_tx.clone(), grpc_tx.clone(), cancel.clone()).await?;
+        sources::yellowstone::run(cfg.clone(), id, account_source_id, slot_tx.clone(), grpc_tx.clone(), drops.clone(), cancel.clone()).await?;
         source_names.insert(id, name.clone());
         active_entry_sources.push((id, name));
         ys_idx += 1;
@@ -255,8 +265,8 @@ async fn main() -> Result<()> {
         let total_pcap = config.sources.pcap.iter().filter(|c| c.enabled).count();
         let mut pcap_idx = 0;
 
-        // (port, interface) → Vec<(name, source_id, include_ips, exclude_ips, recv_buf_size)>
-        let mut groups: BTreeMap<(u16, String), Vec<(String, SourceId, std::collections::HashSet<Ipv4Addr>, std::collections::HashSet<Ipv4Addr>, usize)>> = BTreeMap::new();
+        // (port, interface) → Vec<(name, source_id, include_ips, exclude_ips, recv_buf_size, pin_cpu)>
+        let mut groups: BTreeMap<(u16, String), Vec<(String, SourceId, std::collections::HashSet<Ipv4Addr>, std::collections::HashSet<Ipv4Addr>, usize, Option<usize>)>> = BTreeMap::new();
 
         for cfg in config.sources.pcap.iter().filter(|c| c.enabled) {
             let name = source_name(&cfg.name, "Raw Capture", pcap_idx, total_pcap);
@@ -268,7 +278,7 @@ async fn main() -> Result<()> {
                 .filter_map(|s| s.parse().ok())
                 .collect();
             let key = (cfg.port, cfg.interface.clone());
-            groups.entry(key).or_default().push((name.clone(), id, include, exclude, cfg.recv_buf_size));
+            groups.entry(key).or_default().push((name.clone(), id, include, exclude, cfg.recv_buf_size, cfg.pin_cpu));
             source_names.insert(id, name.clone());
             active_shred_sources.push((id, name));
             pcap_idx += 1;
@@ -276,19 +286,21 @@ async fn main() -> Result<()> {
 
         for ((port, interface), members) in groups {
             let iface_display = if interface.is_empty() { "all".to_string() } else { interface.clone() };
-            let member_names: Vec<&str> = members.iter().map(|(n, _, _, _, _)| n.as_str()).collect();
+            let member_names: Vec<&str> = members.iter().map(|(n, _, _, _, _, _)| n.as_str()).collect();
             info!("Starting pcap socket (port={}, iface={}) for: {:?}", port, iface_display, member_names);
 
-            let recv_buf = members.iter().map(|(_, _, _, _, r)| *r).max().unwrap_or(0);
+            let recv_buf = members.iter().map(|(_, _, _, _, r, _)| *r).max().unwrap_or(0);
+            // Multiple sources share one thread; use the first explicit pin_cpu from the group.
+            let pin_cpu = members.iter().find_map(|(_, _, _, _, _, p)| *p);
             let routes: Vec<sources::pcap::PcapRoute> = members.into_iter()
-                .map(|(_, id, include, exclude, _)| sources::pcap::PcapRoute {
+                .map(|(_, id, include, exclude, _, _)| sources::pcap::PcapRoute {
                     source_id: id,
                     include_ips: include,
                     exclude_ips: exclude,
                 })
                 .collect();
 
-            sources::pcap::run(port, interface, recv_buf, routes, shred_tx.clone(), cancel.clone()).await?;
+            sources::pcap::run(port, interface, recv_buf, routes, clock_anchor, pin_cpu, shred_tx.clone(), drops.clone(), cancel.clone()).await?;
         }
     }
 
@@ -461,7 +473,7 @@ async fn main() -> Result<()> {
         registry.slots.len()
     );
 
-    let bench_stats = compute_stats(&registry, &active_shred_sources, &active_entry_sources, actual_duration);
+    let bench_stats = compute_stats(&registry, &active_shred_sources, &active_entry_sources, &drops, actual_duration);
     let leader_pub = if config.leader_pubkey.is_empty() { None } else { Some(config.leader_pubkey.as_str()) };
     print_results(&bench_stats, start_wall, leader_pub);
 

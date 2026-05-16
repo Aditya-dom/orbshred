@@ -4,7 +4,23 @@
 import json
 import sys
 from collections import defaultdict
+from math import floor
 from pathlib import Path
+
+
+def percentile(sorted_xs, q):
+    """Linear-interpolation percentile (NumPy-style) without the dep.
+    q in [0, 100]; sorted_xs must be sorted ascending."""
+    n = len(sorted_xs)
+    if n == 0:
+        return None
+    if n == 1:
+        return sorted_xs[0]
+    rank = (q / 100.0) * (n - 1)
+    lo = int(floor(rank))
+    hi = min(lo + 1, n - 1)
+    frac = rank - lo
+    return sorted_xs[lo] + frac * (sorted_xs[hi] - sorted_xs[lo])
 
 try:
     import plotly.graph_objects as go
@@ -114,9 +130,8 @@ def build_report(entries, output_path):
             ds = slot_deltas[s].get(src)
             if ds:
                 sorted_ds = sorted(ds)
-                n = len(sorted_ds)
-                p50_vals.append(sorted_ds[int(n * 0.5)] / 1e6)
-                p90_vals.append(sorted_ds[min(int(n * 0.9), n - 1)] / 1e6)
+                p50_vals.append(percentile(sorted_ds, 50) / 1e6)
+                p90_vals.append(percentile(sorted_ds, 90) / 1e6)
             else:
                 p50_vals.append(None)
                 p90_vals.append(None)

@@ -68,6 +68,11 @@ pub struct PcapConfig {
     /// When set, shreds from these IPs are ignored for this source.
     #[serde(default)]
     pub exclude_ips: Vec<String>,
+    /// Pin the capture thread to a specific CPU. Most useful after kernel
+    /// timestamping is enabled and the residual jitter is wakeup-bound.
+    /// Linux only; ignored elsewhere.
+    #[serde(default)]
+    pub pin_cpu: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -81,6 +86,9 @@ pub struct RawUdpConfig {
     pub bind_addr: String,
     #[serde(default)]
     pub recv_buf_size: usize,
+    /// Pin the listener thread to a specific CPU (Linux only). See PcapConfig::pin_cpu.
+    #[serde(default)]
+    pub pin_cpu: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -105,6 +113,9 @@ pub struct JitoConfig {
     pub proxy_udp_addr: String,
     #[serde(default)]
     pub proxy_grpc_addr: String,
+    /// Pin the UDP listener thread to a specific CPU (Linux only). See PcapConfig::pin_cpu.
+    #[serde(default)]
+    pub pin_cpu: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -119,6 +130,9 @@ pub struct DoubleZeroConfig {
     pub port: u16,
     #[serde(default)]
     pub interface: String,
+    /// Pin the listener thread to a specific CPU (Linux only). See PcapConfig::pin_cpu.
+    #[serde(default)]
+    pub pin_cpu: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

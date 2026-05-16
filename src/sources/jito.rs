@@ -10,7 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use ed25519_dalek::Signer;
 
 use crate::config::JitoConfig;
-use crate::registry::{ShredEvent, SlotEvent, SourceId};
+use crate::registry::{DropCounters, ShredEvent, SlotEvent, SourceId};
 use crate::shred::parse_shred_key;
 
 pub mod proto {
@@ -60,17 +60,20 @@ pub async fn run(
     config: JitoConfig,
     shred_source_id: SourceId,
     entry_source_id: SourceId,
-    shred_tx: mpsc::UnboundedSender<ShredEvent>,
-    slot_tx: mpsc::UnboundedSender<SlotEvent>,
+    anchor: crate::sources::kernel_ts::ClockAnchor,
+    shred_tx: mpsc::Sender<ShredEvent>,
+    slot_tx: mpsc::Sender<SlotEvent>,
+    drops: DropCounters,
     cancel: CancellationToken,
 ) -> Result<()> {
     // Direct block engine mode
     if !config.block_engine_url.is_empty() {
         let cfg = config.clone();
         let tx = shred_tx.clone();
+        let drops_clone = drops.clone();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_direct_mode(cfg, tx, cancel_clone, shred_source_id).await {
+            if let Err(e) = run_direct_mode(cfg, tx, drops_clone, cancel_clone, shred_source_id, anchor).await {
                 error!("Jito direct mode error: {:#}", e);
             }
         });
@@ -80,20 +83,29 @@ pub async fn run(
     if !config.proxy_udp_addr.is_empty() {
         let addr = config.proxy_udp_addr.clone();
         let tx = shred_tx.clone();
+        let drops_clone = drops.clone();
         let cancel_clone = cancel.clone();
+        let pin_cpu = config.pin_cpu;
         tokio::task::spawn_blocking(move || {
-            udp_listener(&addr, tx, cancel_clone, shred_source_id, "Jito proxy UDP");
+            if let Some(cpu) = pin_cpu {
+                match crate::sources::affinity::pin_current_thread(cpu) {
+                    Ok(()) => info!("Jito proxy UDP: pinned listener thread to CPU {}", cpu),
+                    Err(e) => warn!("Jito proxy UDP: failed to pin to CPU {}: {}", cpu, e),
+                }
+            }
+            udp_listener(&addr, tx, drops_clone, cancel_clone, shred_source_id, anchor, "Jito proxy UDP");
         });
     }
 
     // Proxy gRPC entries mode
     if !config.proxy_grpc_addr.is_empty() {
         let addr = config.proxy_grpc_addr.clone();
+        let drops_clone = drops.clone();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
             loop {
                 if cancel_clone.is_cancelled() { break; }
-                match run_grpc_entries(&addr, &slot_tx, &cancel_clone, entry_source_id).await {
+                match run_grpc_entries(&addr, &slot_tx, &drops_clone, &cancel_clone, entry_source_id).await {
                     Ok(()) => break,
                     Err(e) => {
                         warn!("Jito gRPC entries error: {:#}, reconnecting...", e);
@@ -113,9 +125,11 @@ pub async fn run(
 
 async fn run_direct_mode(
     config: JitoConfig,
-    shred_tx: mpsc::UnboundedSender<ShredEvent>,
+    shred_tx: mpsc::Sender<ShredEvent>,
+    drops: DropCounters,
     cancel: CancellationToken,
     shred_source_id: SourceId,
+    anchor: crate::sources::kernel_ts::ClockAnchor,
 ) -> Result<()> {
     let keypair = load_keypair(&config.auth_keypair_path)
         .context("Failed to load Jito auth keypair")?;
@@ -138,9 +152,17 @@ async fn run_direct_mode(
     if !config.udp_bind_addr.is_empty() {
         let addr = config.udp_bind_addr.clone();
         let tx = shred_tx.clone();
+        let drops_clone = drops.clone();
         let cancel_clone = cancel.clone();
+        let pin_cpu = config.pin_cpu;
         tokio::task::spawn_blocking(move || {
-            udp_listener(&addr, tx, cancel_clone, shred_source_id, "Jito direct UDP");
+            if let Some(cpu) = pin_cpu {
+                match crate::sources::affinity::pin_current_thread(cpu) {
+                    Ok(()) => info!("Jito direct UDP: pinned listener thread to CPU {}", cpu),
+                    Err(e) => warn!("Jito direct UDP: failed to pin to CPU {}: {}", cpu, e),
+                }
+            }
+            udp_listener(&addr, tx, drops_clone, cancel_clone, shred_source_id, anchor, "Jito direct UDP");
         });
     } else {
         warn!("Jito direct mode: udp_bind_addr not set — shreds will be sent by Jito but not captured");
@@ -155,11 +177,16 @@ async fn run_direct_mode(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+const JITO_RECV_BATCH_SIZE: usize = 64;
+
 fn udp_listener(
     bind_addr: &str,
-    tx: mpsc::UnboundedSender<ShredEvent>,
+    tx: mpsc::Sender<ShredEvent>,
+    drops: DropCounters,
     cancel: CancellationToken,
     source: SourceId,
+    anchor: crate::sources::kernel_ts::ClockAnchor,
     label: &str,
 ) {
     let socket = match UdpSocket::bind(bind_addr) {
@@ -167,7 +194,79 @@ fn udp_listener(
         Err(e) => { error!("{}: bind failed on {}: {}", label, bind_addr, e); return; }
     };
     socket.set_read_timeout(Some(Duration::from_millis(100))).ok();
-    info!("{} listener started on {}", label, bind_addr);
+    let kernel_ts_enabled = enable_kernel_ts_on_udp(&socket);
+    info!(
+        "{} listener started on {} ({})",
+        label,
+        bind_addr,
+        if kernel_ts_enabled { "kernel timestamps, batched recvmmsg" } else { "userland timestamps" }
+    );
+    udp_recv_loop(&socket, source, tx, drops, &anchor, &cancel, kernel_ts_enabled, label);
+    info!("{} listener stopped", label);
+}
+
+#[cfg(target_os = "linux")]
+fn udp_recv_loop(
+    socket: &UdpSocket,
+    source: SourceId,
+    tx: mpsc::Sender<ShredEvent>,
+    drops: DropCounters,
+    anchor: &crate::sources::kernel_ts::ClockAnchor,
+    cancel: &CancellationToken,
+    kernel_ts_enabled: bool,
+    label: &str,
+) {
+    use std::os::unix::io::AsRawFd;
+    let fd = socket.as_raw_fd();
+    if kernel_ts_enabled {
+        let mut batch = crate::sources::kernel_ts::BatchRecv::new(JITO_RECV_BATCH_SIZE, 1280);
+        loop {
+            if cancel.is_cancelled() { break; }
+            match batch.recvmmsg(fd) {
+                Ok(0) => continue,
+                Ok(n) => for i in 0..n {
+                    let frame = batch.frame(i);
+                    if let Some(key) = parse_shred_key(frame) {
+                        let event = ShredEvent {
+                            source,
+                            key,
+                            received_at: batch.timestamp(i, anchor),
+                        };
+                        if tx.try_send(event).is_err() {
+                            drops.inc(source);
+                        }
+                    }
+                },
+                Err(e) => warn!("{} recvmmsg error: {}", label, e),
+            }
+        }
+    } else {
+        single_udp_loop(socket, source, tx, drops, cancel, label);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn udp_recv_loop(
+    socket: &UdpSocket,
+    source: SourceId,
+    tx: mpsc::Sender<ShredEvent>,
+    drops: DropCounters,
+    _anchor: &crate::sources::kernel_ts::ClockAnchor,
+    cancel: &CancellationToken,
+    _kernel_ts_enabled: bool,
+    label: &str,
+) {
+    single_udp_loop(socket, source, tx, drops, cancel, label);
+}
+
+fn single_udp_loop(
+    socket: &UdpSocket,
+    source: SourceId,
+    tx: mpsc::Sender<ShredEvent>,
+    drops: DropCounters,
+    cancel: &CancellationToken,
+    label: &str,
+) {
     let mut buf = vec![0u8; 1280];
     loop {
         if cancel.is_cancelled() { break; }
@@ -175,16 +274,33 @@ fn udp_listener(
             Ok((len, _)) => {
                 let received_at = Instant::now();
                 if let Some(key) = parse_shred_key(&buf[..len]) {
-                    let _ = tx.send(ShredEvent { source, key, received_at });
+                    let event = ShredEvent { source, key, received_at };
+                    if tx.try_send(event).is_err() {
+                        drops.inc(source);
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                   || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => { warn!("{} recv error: {}", label, e); }
+                  || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => warn!("{} recv error: {}", label, e),
         }
     }
-    info!("{} listener stopped", label);
 }
+
+#[cfg(target_os = "linux")]
+fn enable_kernel_ts_on_udp(socket: &UdpSocket) -> bool {
+    use std::os::unix::io::AsRawFd;
+    match crate::sources::kernel_ts::enable_kernel_timestamps(socket.as_raw_fd()) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Jito UDP: SO_TIMESTAMPNS unavailable, using userland timestamps: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_kernel_ts_on_udp(_socket: &UdpSocket) -> bool { false }
 
 async fn authenticate(channel: Channel, keypair: &[u8; 64]) -> Result<TokenPair> {
     let pubkey = &keypair[32..64];
@@ -312,7 +428,8 @@ async fn try_refresh(channel: Channel, tokens: &TokenPair, keypair: &[u8; 64]) -
 
 async fn run_grpc_entries(
     addr: &str,
-    tx: &mpsc::UnboundedSender<SlotEvent>,
+    tx: &mpsc::Sender<SlotEvent>,
+    drops: &DropCounters,
     cancel: &CancellationToken,
     source_id: SourceId,
 ) -> anyhow::Result<()> {
@@ -330,11 +447,14 @@ async fn run_grpc_entries(
         };
         match msg {
             Some(Ok(entry)) => {
-                let _ = tx.send(SlotEvent {
+                let event = SlotEvent {
                     source: source_id,
                     slot: entry.slot,
                     received_at: Instant::now(),
-                });
+                };
+                if tx.try_send(event).is_err() {
+                    drops.inc(source_id);
+                }
             }
             Some(Err(e)) => return Err(e.into()),
             None => break,

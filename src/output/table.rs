@@ -79,6 +79,8 @@ struct CoverageRow {
     dupes: String,
     #[tabled(rename = "Missed")]
     missed: String,
+    #[tabled(rename = "Drops")]
+    drops: String,
 }
 
 #[derive(Tabled)]
@@ -97,6 +99,8 @@ struct SlotRow {
     source: String,
     #[tabled(rename = "Slots")]
     slots: String,
+    #[tabled(rename = "Drops")]
+    drops: String,
     #[tabled(rename = "  p50  ")]
     p50: String,
     #[tabled(rename = "  p90  ")]
@@ -237,6 +241,7 @@ pub fn print_results(stats: &BenchmarkStats, start_time: chrono::DateTime<chrono
                 coverage: coverage(s.received, total),
                 dupes: num_fmt(s.dupes),
                 missed: num_fmt(s.missed),
+                drops: num_fmt(s.drops),
             })
         })
         .collect();
@@ -285,6 +290,7 @@ pub fn print_results(stats: &BenchmarkStats, start_time: chrono::DateTime<chrono
             (p50_raw, SlotRow {
                 source: s.name.clone(),
                 slots: num_fmt(s.slots_seen),
+                drops: num_fmt(s.drops),
                 p50: fmt_ns(p.p50),
                 p90: fmt_ns(p.p90),
                 p95: fmt_ns(p.p95),

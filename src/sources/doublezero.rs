@@ -8,16 +8,27 @@ use tracing::{debug, error, info, warn};
 use anyhow::Result;
 
 use crate::config::DoubleZeroConfig;
-use crate::registry::{ShredEvent, SourceId};
+use crate::registry::{DropCounters, ShredEvent, SourceId};
 use crate::shred::parse_shred_key;
+use crate::sources::kernel_ts::ClockAnchor;
 
 pub async fn run(
     config: DoubleZeroConfig,
     source_id: SourceId,
-    tx: mpsc::UnboundedSender<ShredEvent>,
+    anchor: ClockAnchor,
+    tx: mpsc::Sender<ShredEvent>,
+    drops: DropCounters,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let pin_cpu = config.pin_cpu;
     tokio::task::spawn_blocking(move || {
+        if let Some(cpu) = pin_cpu {
+            match crate::sources::affinity::pin_current_thread(cpu) {
+                Ok(()) => info!("DoubleZero: pinned listener thread to CPU {}", cpu),
+                Err(e) => warn!("DoubleZero: failed to pin to CPU {}: {}", cpu, e),
+            }
+        }
+
         let multicast_ip = match Ipv4Addr::from_str(&config.multicast_group) {
             Ok(ip) => ip,
             Err(e) => {
@@ -73,67 +84,28 @@ pub async fn run(
         socket.set_read_timeout(Some(Duration::from_millis(100))).ok();
 
         let std_socket: UdpSocket = socket.into();
+        let kernel_ts_enabled = enable_kernel_ts_on_udp(&std_socket);
         info!(
-            "DoubleZero multicast listener started (group={}, port={}, iface={})",
-            multicast_ip, config.port, config.interface
+            "DoubleZero multicast listener started (group={}, port={}, iface={}, {})",
+            multicast_ip, config.port, config.interface,
+            if kernel_ts_enabled { "kernel timestamps" } else { "userland timestamps" }
         );
 
-        let mut buf = vec![0u8; 1280];
         let mut raw_count: u64 = 0;
         let mut parsed_count: u64 = 0;
         let mut last_log = std::time::Instant::now();
-        loop {
-            if cancel.is_cancelled() {
-                break;
-            }
-            match std_socket.recv_from(&mut buf) {
-                Ok((len, src)) => {
-                    let received_at = Instant::now();
-                    raw_count += 1;
-
-                    // On the very first packet, dump its header bytes so we can
-                    // verify the shred format / detect any wrapper header.
-                    if raw_count == 1 {
-                        let dump_len = len.min(96);
-                        let hex: String = buf[..dump_len]
-                            .iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        info!(
-                            "DoubleZero: first packet from {} len={} header bytes: {}",
-                            src, len, hex
-                        );
-                    }
-
-                    if let Some(key) = parse_shred_key(&buf[..len]) {
-                        parsed_count += 1;
-                        let _ = tx.send(ShredEvent {
-                            source: source_id,
-                            key,
-                            received_at,
-                        });
-                    } else {
-                        debug!("DoubleZero: packet len={} did not parse as shred", len);
-                    }
-
-                    // Log raw vs parsed counts every 5 seconds
-                    if last_log.elapsed() >= Duration::from_secs(5) {
-                        info!(
-                            "DoubleZero: {} raw packets received, {} parsed as shreds",
-                            raw_count, parsed_count
-                        );
-                        last_log = std::time::Instant::now();
-                    }
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => {
-                    warn!("DoubleZero recv error: {}", e);
-                }
-            }
-        }
+        run_dz_recv_loop(
+            &std_socket,
+            source_id,
+            &anchor,
+            &tx,
+            &drops,
+            &cancel,
+            kernel_ts_enabled,
+            &mut raw_count,
+            &mut parsed_count,
+            &mut last_log,
+        );
         if raw_count > 0 {
             info!(
                 "DoubleZero listener stopped ({} raw packets, {} parsed)",
@@ -192,6 +164,134 @@ fn join_multicast_by_index(socket: &Socket, multicast_ip: Ipv4Addr, iface_name: 
     let iface_ip = get_interface_ip(iface_name).unwrap_or(Ipv4Addr::UNSPECIFIED);
     socket.join_multicast_v4(&multicast_ip, &iface_ip)?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const RECV_BATCH_SIZE: usize = 64;
+
+#[cfg(target_os = "linux")]
+fn enable_kernel_ts_on_udp(socket: &UdpSocket) -> bool {
+    use std::os::unix::io::AsRawFd;
+    match crate::sources::kernel_ts::enable_kernel_timestamps(socket.as_raw_fd()) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("DoubleZero: SO_TIMESTAMPNS unavailable, using userland timestamps: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_kernel_ts_on_udp(_socket: &UdpSocket) -> bool { false }
+
+#[allow(clippy::too_many_arguments)]
+fn run_dz_recv_loop(
+    socket: &UdpSocket,
+    source_id: SourceId,
+    anchor: &ClockAnchor,
+    tx: &mpsc::Sender<ShredEvent>,
+    drops: &DropCounters,
+    cancel: &CancellationToken,
+    kernel_ts_enabled: bool,
+    raw_count: &mut u64,
+    parsed_count: &mut u64,
+    last_log: &mut std::time::Instant,
+) {
+    #[cfg(target_os = "linux")]
+    if kernel_ts_enabled {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let mut batch = crate::sources::kernel_ts::BatchRecv::new(RECV_BATCH_SIZE, 1280);
+        loop {
+            if cancel.is_cancelled() { break; }
+            match batch.recvmmsg(fd) {
+                Ok(0) => continue,
+                Ok(n) => for i in 0..n {
+                    let frame = batch.frame(i);
+                    *raw_count += 1;
+                    if *raw_count == 1 {
+                        let dump_len = frame.len().min(96);
+                        let hex: String = frame[..dump_len]
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        info!(
+                            "DoubleZero: first packet (kernel-ts) len={} header bytes: {}",
+                            frame.len(), hex
+                        );
+                    }
+                    if let Some(key) = parse_shred_key(frame) {
+                        *parsed_count += 1;
+                        let event = ShredEvent {
+                            source: source_id,
+                            key,
+                            received_at: batch.timestamp(i, anchor),
+                        };
+                        if tx.try_send(event).is_err() {
+                            drops.inc(source_id);
+                        }
+                    } else {
+                        debug!("DoubleZero: packet len={} did not parse as shred", frame.len());
+                    }
+                    if last_log.elapsed() >= Duration::from_secs(5) {
+                        info!(
+                            "DoubleZero: {} raw packets received, {} parsed as shreds",
+                            *raw_count, *parsed_count
+                        );
+                        *last_log = std::time::Instant::now();
+                    }
+                },
+                Err(e) => warn!("DoubleZero recvmmsg error: {}", e),
+            }
+        }
+        return;
+    }
+
+    // Fallback path (userland timestamps, single recv).
+    let _ = anchor;
+    let _ = kernel_ts_enabled;
+    let mut buf = vec![0u8; 1280];
+    loop {
+        if cancel.is_cancelled() { break; }
+        match socket.recv_from(&mut buf) {
+            Ok((len, src)) => {
+                let received_at = Instant::now();
+                *raw_count += 1;
+                if *raw_count == 1 {
+                    let dump_len = len.min(96);
+                    let hex: String = buf[..dump_len]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    info!(
+                        "DoubleZero: first packet from {} len={} header bytes: {}",
+                        src, len, hex
+                    );
+                }
+                if let Some(key) = parse_shred_key(&buf[..len]) {
+                    *parsed_count += 1;
+                    let event = ShredEvent { source: source_id, key, received_at };
+                    if tx.try_send(event).is_err() {
+                        drops.inc(source_id);
+                    }
+                } else {
+                    debug!("DoubleZero: packet len={} did not parse as shred", len);
+                }
+                if last_log.elapsed() >= Duration::from_secs(5) {
+                    info!(
+                        "DoubleZero: {} raw packets received, {} parsed as shreds",
+                        *raw_count, *parsed_count
+                    );
+                    *last_log = std::time::Instant::now();
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                  || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => warn!("DoubleZero recv error: {}", e),
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

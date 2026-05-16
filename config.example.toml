@@ -29,6 +29,7 @@ duration_secs = 60
 # enabled = false
 bind_addr = "0.0.0.0:8001"
 # recv_buf_size = 10485760   # 10 MB — optional, omit for system default
+# pin_cpu = 4                # Linux only — pin listener thread to a specific CPU
 
 # ── Raw Capture (AF_PACKET) ─────────────────────────────────────────────────
 # Capture shreds at kernel level without binding the port.
@@ -39,6 +40,7 @@ bind_addr = "0.0.0.0:8001"
 port = 8001                   # your validator's TVU port
 # interface = "eth0"          # optional — omit to capture all interfaces
 # recv_buf_size = 10485760    # optional
+# pin_cpu = 5                 # Linux only — pin capture thread to a specific CPU
 
 # IP filtering — measure individual providers on the same port.
 # Multiple pcap sources on the same port+interface share a single socket.
@@ -71,6 +73,7 @@ auth_keypair_path = "/path/to/jito-keypair.json"
 desired_regions   = ["frankfurt"]
 public_ip         = "1.2.3.4"
 udp_bind_addr     = "0.0.0.0:20000"
+# pin_cpu = 6                # Linux only — pin UDP listener thread to a specific CPU
 # Proxy mode (instead of or in addition to direct):
 # proxy_udp_addr  = "127.0.0.1:50001"
 # proxy_grpc_addr = "http://127.0.0.1:10001"
@@ -92,6 +95,7 @@ udp_bind_addr     = "0.0.0.0:20000"
 multicast_group = "233.84.178.1"
 port      = 7733
 interface = "doublezero1"
+# pin_cpu = 7               # Linux only — pin listener thread to a specific CPU
 
 # ── Yellowstone gRPC ────────────────────────────────────────────────────────
 # Geyser plugin — measures slot and optional account update latency.

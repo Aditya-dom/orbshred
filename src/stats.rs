@@ -1,5 +1,5 @@
 use std::time::Instant;
-use crate::registry::{Registry, SourceId};
+use crate::registry::{DropCounters, Registry, SourceId};
 use crate::shred::ShredType;
 
 /// Stats for a shred-level source (Raw UDP, Jito UDP, DoubleZero, …)
@@ -13,6 +13,10 @@ pub struct SourceStats {
     pub wins: u64,
     pub missed: u64,
     pub dupes: u64,
+    /// Events the source produced but could not enqueue because the bounded
+    /// aggregator channel was full. A non-zero value means the registry was
+    /// momentarily behind and the source's true production rate is undercounted.
+    pub drops: u64,
     /// Latency deltas in nanoseconds (vs global first arrival)
     pub latency_ns: Vec<u64>,
 }
@@ -23,6 +27,8 @@ pub struct EntrySourceStats {
     pub id: SourceId,
     pub name: String,
     pub slots_seen: u64,
+    /// See [`SourceStats::drops`].
+    pub drops: u64,
     /// Latency vs first shred arrival for same slot (nanoseconds)
     pub latency_ns: Vec<u64>,
 }
@@ -99,6 +105,7 @@ pub fn compute_stats(
     registry: &Registry,
     active_shred_sources: &[(SourceId, String)],
     active_entry_sources: &[(SourceId, String)],
+    drops: &DropCounters,
     duration_secs: f64,
 ) -> BenchmarkStats {
     let total_unique_shreds = registry.shreds.len() as u64;
@@ -117,7 +124,12 @@ pub fn compute_stats(
     // Per shred-level source stats
     let mut source_stats: Vec<SourceStats> = active_shred_sources
         .iter()
-        .map(|(id, name)| SourceStats { id: *id, name: name.clone(), ..Default::default() })
+        .map(|(id, name)| SourceStats {
+            id: *id,
+            name: name.clone(),
+            drops: drops.get(*id),
+            ..Default::default()
+        })
         .collect();
 
     for entry in registry.shreds.iter() {
@@ -159,7 +171,13 @@ pub fn compute_stats(
         total_slots: registry.slots.len() as u64,
         entry_sources: active_entry_sources
             .iter()
-            .map(|(id, name)| EntrySourceStats { id: *id, name: name.clone(), slots_seen: 0, latency_ns: vec![] })
+            .map(|(id, name)| EntrySourceStats {
+                id: *id,
+                name: name.clone(),
+                slots_seen: 0,
+                drops: drops.get(*id),
+                latency_ns: vec![],
+            })
             .collect(),
     };
 

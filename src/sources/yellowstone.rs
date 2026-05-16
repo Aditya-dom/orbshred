@@ -9,7 +9,7 @@ use anyhow::Result;
 use futures::StreamExt;
 
 use crate::config::YellowstoneConfig;
-use crate::registry::{GrpcLatencyEvent, SlotEvent, SourceId};
+use crate::registry::{DropCounters, GrpcLatencyEvent, SlotEvent, SourceId};
 
 pub mod proto {
     pub mod geyser {
@@ -27,8 +27,9 @@ pub async fn run(
     config: YellowstoneConfig,
     source_id: SourceId,
     account_source_id: Option<SourceId>,
-    tx: mpsc::UnboundedSender<SlotEvent>,
-    grpc_tx: mpsc::UnboundedSender<GrpcLatencyEvent>,
+    tx: mpsc::Sender<SlotEvent>,
+    grpc_tx: mpsc::Sender<GrpcLatencyEvent>,
+    drops: DropCounters,
     cancel: CancellationToken,
 ) -> Result<()> {
     tokio::spawn(async move {
@@ -37,7 +38,7 @@ pub async fn run(
                 break;
             }
 
-            match connect_and_stream(&config, &tx, &grpc_tx, &cancel, source_id, account_source_id).await {
+            match connect_and_stream(&config, &tx, &grpc_tx, &drops, &cancel, source_id, account_source_id).await {
                 Ok(()) => break,
                 Err(e) => {
                     warn!("Yellowstone stream error: {}, reconnecting...", e);
@@ -65,8 +66,9 @@ struct EntryRecord {
 
 async fn connect_and_stream(
     config: &YellowstoneConfig,
-    tx: &mpsc::UnboundedSender<SlotEvent>,
-    grpc_tx: &mpsc::UnboundedSender<GrpcLatencyEvent>,
+    tx: &mpsc::Sender<SlotEvent>,
+    grpc_tx: &mpsc::Sender<GrpcLatencyEvent>,
+    drops: &DropCounters,
     cancel: &CancellationToken,
     source_id: SourceId,
     account_source_id: Option<SourceId>,
@@ -155,11 +157,14 @@ async fn connect_and_stream(
                 match update.update_oneof {
                     Some(UpdateOneof::Slot(slot_update)) => {
                         if slot_update.status == SlotStatus::SlotFirstShredReceived as i32 {
-                            let _ = tx.send(SlotEvent {
+                            let event = SlotEvent {
                                 source: source_id,
                                 slot: slot_update.slot,
                                 received_at,
-                            });
+                            };
+                            if tx.try_send(event).is_err() {
+                                drops.inc(source_id);
+                            }
                         }
                     }
                     Some(UpdateOneof::Entry(entry_update)) => {
@@ -180,11 +185,14 @@ async fn connect_and_stream(
                         if !acct_update.is_startup {
                             if let Some(aid) = account_source_id {
                                 // Emit the slot-vs-first-shred measurement (existing behaviour)
-                                let _ = tx.send(SlotEvent {
+                                let slot_event = SlotEvent {
                                     source: aid,
                                     slot: acct_update.slot,
                                     received_at,
-                                });
+                                };
+                                if tx.try_send(slot_event).is_err() {
+                                    drops.inc(aid);
+                                }
 
                                 // Emit gRPC overhead: find the latest entry delivered for this
                                 // slot that arrived before this account update.
@@ -200,10 +208,13 @@ async fn connect_and_stream(
                                         let delta_ns = received_at
                                             .duration_since(entry.received_at)
                                             .as_nanos() as u64;
-                                        let _ = grpc_tx.send(GrpcLatencyEvent {
+                                        let grpc_event = GrpcLatencyEvent {
                                             source: aid,
                                             latency_ns: delta_ns,
-                                        });
+                                        };
+                                        if grpc_tx.try_send(grpc_event).is_err() {
+                                            drops.inc(aid);
+                                        }
                                     }
                                 }
                             }

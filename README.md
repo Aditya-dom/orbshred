@@ -4,6 +4,8 @@ Connects to multiple Solana shred sources simultaneously, records nanosecond-pre
 
 All latency numbers are relative — measured against the earliest arrival across all running sources on the same machine. No clock sync required.
 
+On Linux, UDP-based sources (Raw UDP, AF_PACKET pcap, Jito ShredStream UDP, DoubleZero multicast) read the per-packet kernel reception timestamp via `SO_TIMESTAMPNS` cmsg, batched through `recvmmsg`. This removes NIC-IRQ → softirq → scheduler-wakeup jitter from the measurement, so per-source numbers stay directly comparable. On other platforms, the tool falls back to `Instant::now()` taken after `recv()` returns.
+
 ---
 
 ## Sources
@@ -85,7 +87,7 @@ Per-shred latency delta vs the globally fastest source. If Raw UDP has p50 = 0 �
 For each shred, which source delivered it first. Shows `Won First` (count), `Total Received` (how many shreds that source saw), and `Win Rate` (Won First / Total Received). A source with low total received but high win rate is fast when it has the data — it just doesn't cover all validators.
 
 **COVERAGE & RELIABILITY**
-What fraction of all observed shreds each source received. A source can be fast but still miss shreds — coverage shows reliability.
+What fraction of all observed shreds each source received. A source can be fast but still miss shreds — coverage shows reliability. The `Drops` column counts events the source produced but couldn't enqueue because the bounded aggregator channel was full — a non-zero value means the registry briefly fell behind under burst and that source's true production rate is undercounted in the other columns.
 
 **SHRED TYPE BREAKDOWN**
 Data shreds carry actual block content. FEC (code) shreds are Reed-Solomon parity for erasure recovery. High FEC counts with low data counts may indicate the source is only sending recovery data, not primary shreds.
@@ -225,6 +227,15 @@ The report includes:
 
 ---
 
+## Tuning
+
+- **Kernel timestamps**: enabled automatically on Linux for UDP / AF_PACKET sources. On a Linux validator host, expect single-digit-microsecond inter-source p50s on the same packet. If `setsockopt(SO_TIMESTAMPNS)` fails (rare), the source logs a warning and falls back to userland timestamps.
+- **Bounded channels**: each source publishes through a bounded channel into the aggregator. If you see a non-zero `Drops` column under burst, the aggregator is the bottleneck (not the kernel). Either reduce the number of concurrent sources, or run on a faster host.
+- **`pin_cpu`**: each UDP source's config can pin its listener thread to an isolated core (`isolcpus=N` at boot, then `pin_cpu = N` in the config). Most useful once kernel timestamps are in place and the residual jitter is wakeup-bound. Linux only.
+- **Yellowstone gRPC sources** can't get kernel timestamps and are measured at userland delivery time — don't compare their numbers directly to kernel-stamped UDP sources.
+
+---
+
 ## Limitations
 
 - All latency numbers are relative to the fastest source on the same machine — not absolute wall-clock latency from block production
@@ -232,3 +243,4 @@ The report includes:
 - With only one source enabled, the latency table shows all zeros
 - Yellowstone measurements are at slot/entry granularity and cannot be directly compared to per-shred numbers
 - Raw packet capture and DoubleZero are Linux-only
+- Kernel timestamping and `pin_cpu` are Linux-only; macOS/BSD fall back to userland `Instant::now()` after `recv()`
