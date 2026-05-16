@@ -1,0 +1,114 @@
+# ── Run mode ──────────────────────────────────────────────────────────────────
+# Option A: fixed duration in seconds
+duration_secs = 60
+
+# Option B: slot range — omit duration_secs (or set it to 0)
+# The run stops automatically ~2s after a shred beyond end_slot is seen.
+# start_slot = 350000000
+# end_slot   = 350001000
+
+# Stop if no shreds arrive for this many seconds (default: 30).
+# silence_timeout_secs = 30
+
+# ── Leader filter (optional) ─────────────────────────────────────────────────
+# Only record shreds from slots where this validator is leader.
+# Fetches the leader schedule from the RPC at startup.
+# leader_pubkey = "YourValidatorIdentityPubkey..."
+# rpc_url = "http://127.0.0.1:8899"
+
+# ── Sources ────────────────────────────────────────────────────────────────────
+# At least one source is required. All others are optional.
+# Sources default to enabled = true, so you can omit the `enabled` line.
+# The `name` field is optional — defaults to the source type name.
+# Multiple instances of any type are supported — just add more blocks.
+
+# ── Raw UDP ──────────────────────────────────────────────────────────────────
+# Bind a UDP port and receive raw Turbine shreds directly.
+[[sources.raw_udp]]
+# name = "Turbine"
+# enabled = false
+bind_addr = "0.0.0.0:8001"
+# recv_buf_size = 10485760   # 10 MB — optional, omit for system default
+
+# ── Raw Capture (AF_PACKET) ─────────────────────────────────────────────────
+# Capture shreds at kernel level without binding the port.
+# Linux only, requires: sudo setcap cap_net_raw=eip ./target/release/orbshred
+[[sources.pcap]]
+# name = "TVU Capture"
+# enabled = false
+port = 8001                   # your validator's TVU port
+# interface = "eth0"          # optional — omit to capture all interfaces
+# recv_buf_size = 10485760    # optional
+
+# IP filtering — measure individual providers on the same port.
+# Multiple pcap sources on the same port+interface share a single socket.
+# source_ips = ["1.1.1.1"]   # only capture from these IPs
+# exclude_ips = ["2.2.2.2"]  # ignore packets from these IPs
+
+# Example: split providers on the same TVU port
+#[[sources.pcap]]
+#name = "Provider A"
+#port = 8001
+#source_ips = ["1.1.1.1"]
+#
+#[[sources.pcap]]
+#name = "Provider B"
+#port = 8001
+#source_ips = ["2.2.2.2"]
+#
+#[[sources.pcap]]
+#name = "Turbine"
+#port = 8001
+#exclude_ips = ["1.1.1.1", "2.2.2.2"]
+
+# ── Jito ShredStream ────────────────────────────────────────────────────────
+# Direct block engine — benchmark authenticates and sends heartbeats itself.
+[[sources.jito]]
+# name = "Jito Frankfurt"
+# enabled = false
+block_engine_url  = "https://frankfurt.mainnet.block-engine.jito.wtf"
+auth_keypair_path = "/path/to/jito-keypair.json"
+desired_regions   = ["frankfurt"]
+public_ip         = "1.2.3.4"
+udp_bind_addr     = "0.0.0.0:20000"
+# Proxy mode (instead of or in addition to direct):
+# proxy_udp_addr  = "127.0.0.1:50001"
+# proxy_grpc_addr = "http://127.0.0.1:10001"
+
+# Multiple Jito regions — each needs its own udp_bind_addr port.
+#[[sources.jito]]
+#name = "Jito Amsterdam"
+#block_engine_url  = "https://amsterdam.mainnet.block-engine.jito.wtf"
+#auth_keypair_path = "/path/to/jito-keypair.json"
+#desired_regions   = ["amsterdam"]
+#public_ip         = "1.2.3.4"
+#udp_bind_addr     = "0.0.0.0:20001"
+
+# ── DoubleZero ──────────────────────────────────────────────────────────────
+# Private fiber multicast network. Requires on-chain subscription + doublezerod.
+[[sources.doublezero]]
+# name = "DoubleZero"
+# enabled = false
+multicast_group = "233.84.178.1"
+port      = 7733
+interface = "doublezero1"
+
+# ── Yellowstone gRPC ────────────────────────────────────────────────────────
+# Geyser plugin — measures slot and optional account update latency.
+[[sources.yellowstone]]
+# name = "Yellowstone"
+# enabled = false
+endpoint = "http://127.0.0.1:10000"
+# x_token = ""   # omit if no auth required
+
+# Optional: measure time from first slot shred → account update delivery.
+# Subscribes at PROCESSED commitment. Also measures pure gRPC overhead
+# (entry processed → account update delivered) in a separate table.
+# account_pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+# account_name   = "Token Program"   # display name (defaults to "<source> (account)")
+
+# ── Output (optional) ───────────────────────────────────────────────────────
+# Omit this section entirely if you don't want a log file.
+# Enable to use with plot.py for interactive HTML reports.
+# [output]
+# log_file = "orbshred.log"
